@@ -1,0 +1,13 @@
+streamlit
+opencv-python
+ultralytics
+openai-whisper
+langchain
+langchain-google-genai
+chromadb
+networkx
+moviepy
+python-dotenv
+scikit-learn
+matplotlib
+numpy>=1.26.0

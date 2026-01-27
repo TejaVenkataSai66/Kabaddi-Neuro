@@ -1,0 +1,17 @@
+{
+    "match_id": "pkl_final_puneri_vs_haryana",
+    "teams": {
+        "team_A": {
+            "name": "Puneri Paltan",
+            "description": "Orange Jersey (Raider)",
+            "color_hsv_lower": [5, 150, 150],
+            "color_hsv_upper": [25, 255, 255]
+        },
+        "team_B": {
+            "name": "Haryana Steelers",
+            "description": "Dark Blue Jersey (Defenders)",
+            "color_hsv_lower": [100, 100, 50],
+            "color_hsv_upper": [130, 255, 255]
+        }
+    }
+}
