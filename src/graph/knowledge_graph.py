@@ -1,204 +1,162 @@
 import networkx as nx
-import matplotlib.pyplot as plt
 import json
 import os
-import re
+import glob
+import matplotlib.pyplot as plt
+from collections import Counter
+import time
 
 class KabaddiGraph:
-    def __init__(self, config_path="match_config.json"):
-        self.graph = nx.DiGraph()
-        self.config = self.load_config(config_path)
-        
-        # 1. SETUP MATCH & TEAMS
-        match_id = self.config.get("match_id", "Final_Match")
-        self.root_node = match_id
-        self.graph.add_node(match_id, type="Match", label="PKL Final 2025", layer=0)
-        
-        # Load Teams
-        teams = self.config.get("teams", {})
-        self.team_a = teams.get("team_A", {}).get("name", "Team A")
-        self.team_b = teams.get("team_B", {}).get("name", "Team B")
-        
-        # Create Team Nodes (Layer 1)
-        self.graph.add_node(self.team_a, type="Team", color="orange", layer=1)
-        self.graph.add_node(self.team_b, type="Team", color="blue", layer=1)
-        
-        self.graph.add_edge(match_id, self.team_a, relation="FEATURED_TEAM")
-        self.graph.add_edge(match_id, self.team_b, relation="FEATURED_TEAM")
+    def __init__(self):
+        self.G = nx.DiGraph()
+        self.clips_data = []
 
-    def load_config(self, path):
+    def load_data(self, unified_dir, callback=None):
+        if callback: callback({"type": "log", "msg": "📊 Loading Unified Data for Topology..."})
+        files = sorted(glob.glob(os.path.join(unified_dir, "*.json")))
+        self.clips_data = []
+        for f in files:
+            with open(f, 'r') as file:
+                self.clips_data.append(json.load(file))
+        if callback: callback({"type": "log", "msg": f"✅ Graph Loader: Loaded {len(self.clips_data)} clips."})
+
+    def build_graph(self, callback=None):
+        self.G.clear()
+        previous_clip_id = None
+        
+        if callback: callback({"type": "log", "msg": "🕸️ Constructing Tactical Network (Deep Analysis)..."})
+
+        for i, clip in enumerate(self.clips_data):
+            clip_id = clip.get("clip_id")
+            visuals = clip.get("visual_context", {})
+            metrics = visuals.get("tactical_metrics", {})
+            audio = clip.get("audio_context", {})
+            zonal = visuals.get("zonal_analysis", {})
+            
+            # --- 1. BLUE NODE (Clip) ---
+            self.G.add_node(clip_id, type="clip", time_index=i)
+            if callback:
+                callback({
+                    "type": "deep_log", 
+                    "msg": f"🔵 [CLIP NODE] Created: {clip_id} (Time Index: {i})"
+                })
+
+            # --- 2. TEMPORAL LINK ---
+            if previous_clip_id:
+                self.G.add_edge(previous_clip_id, clip_id, relation="NEXT_PLAY")
+                if callback:
+                     callback({
+                        "type": "deep_log", 
+                        "msg": f"   ↳ ⛓️ [LINK] Temporal Flow: {previous_clip_id} --> {clip_id}"
+                    })
+            previous_clip_id = clip_id
+            
+            # --- 3. ORANGE NODE (Tactic) ---
+            vector = metrics.get("attack_vector", "None")
+            if vector and vector != "None":
+                node_name = f"Tactic: {vector}"
+                self.G.add_node(node_name, type="tactic")
+                self.G.add_edge(clip_id, node_name, relation="USES_STRATEGY")
+                if callback: 
+                    callback({
+                        "type": "deep_log", 
+                        "msg": f"   ↳ 🟠 [TACTIC NODE] Identified Strategy: '{vector}' -> Linked to {clip_id}"
+                    })
+
+            # --- 4. GREEN NODE (State) ---
+            def_count = metrics.get("defender_pack_size", 0)
+            if def_count > 0:
+                if def_count <= 3: 
+                    state_name = "State: Super Tackle Opp"
+                    reason = "Defenders <= 3 (High Stakes)"
+                elif def_count == 7: 
+                    state_name = "State: Full Defense"
+                    reason = "Defenders == 7 (Max Strength)"
+                else: 
+                    state_name = f"State: {def_count} Defenders"
+                    reason = f"Standard Defense ({def_count})"
+                
+                self.G.add_node(state_name, type="state")
+                self.G.add_edge(clip_id, state_name, relation="GAME_STATE")
+                if callback: 
+                    callback({
+                        "type": "deep_log", 
+                        "msg": f"   ↳ 🟢 [STATE NODE] Context: '{state_name}' (Reason: {reason})"
+                    })
+
+            # --- 5. RED NODE (Event) ---
+            ref_calls = audio.get("referee_events", [])
+            for call in ref_calls:
+                call_clean = call.split(']')[-1].strip()
+                node_name = f"Ref: {call_clean}"
+                self.G.add_node(node_name, type="event")
+                self.G.add_edge(clip_id, node_name, relation="OCCURRED")
+                if callback: 
+                    callback({
+                        "type": "deep_log", 
+                        "msg": f"   ↳ 🔴 [EVENT NODE] Outcome Detected: '{call_clean}' -> Linking Result"
+                    })
+                    
+            # --- 6. YELLOW NODE (Zonal) ---
+            if zonal:
+                court_dist = zonal.get("court_distribution_percentages", {})
+                if court_dist:
+                    highest_zone = max(court_dist, key=court_dist.get)
+                    zonal_node = f"Zone: {highest_zone.replace('_', ' ').title()}"
+                    self.G.add_node(zonal_node, type="zone")
+                    self.G.add_edge(clip_id, zonal_node, relation="PRIMARY_ATTACK_ZONE")
+                    if callback: 
+                        callback({
+                            "type": "deep_log", 
+                            "msg": f"   ↳ 🟡 [ZONE NODE] Attack Zone: '{zonal_node}' -> Linked to {clip_id}"
+                        })
+            
+            # Pacing for UI
+            time.sleep(0.1)
+
+    def get_tactical_insights(self):
+        insights = {}
+        tactic_nodes = [n for n, attr in self.G.nodes(data=True) if attr.get("type") == "tactic"]
+        if tactic_nodes:
+            degrees = self.G.degree(tactic_nodes)
+            top_tactic = max(degrees, key=lambda x: x[1])
+            insights["dominant_strategy"] = top_tactic[0]
+        else:
+            insights["dominant_strategy"] = "None"
+
+        super_tackle_nodes = [n for n in self.G.predecessors("State: Super Tackle Opp")] if "State: Super Tackle Opp" in self.G else []
+        insights["super_tackle_scenarios"] = len(super_tackle_nodes)
+        
+        zone_nodes = [n for n, attr in self.G.nodes(data=True) if attr.get("type") == "zone"]
+        if zone_nodes:
+            z_degrees = self.G.degree(zone_nodes)
+            top_zone = max(z_degrees, key=lambda x: x[1])
+            insights["frequent_attack_zone"] = top_zone[0]
+        else:
+            insights["frequent_attack_zone"] = "None"
+            
+        return insights
+
+    def visualize_match_topology(self, output_path="data/match_graph.png"):
         try:
-            with open(path, 'r') as f: return json.load(f)
-        except: return {}
-
-    def natural_sort_key(self, s):
-        return [int(text) if text.isdigit() else text.lower() for text in re.split('([0-9]+)', s)]
-
-    def add_clip_logic(self, clip_id, vision_data, transcript, previous_clip_id):
-        # --- DATA EXTRACTION ---
-        player_count = vision_data.get('max_players_visible', 0)
-        is_raid_vision = vision_data.get('is_raid_likely', False)
-        text_lower = transcript.lower()
-        
-        # Node: Video Clip (Layer 2)
-        self.graph.add_node(
-            clip_id, 
-            type="VideoClip", 
-            transcript=transcript[:40]+"...",
-            layer=2
-        )
-        
-        # CHRONOLOGY LINK
-        if previous_clip_id:
-            self.graph.add_edge(previous_clip_id, clip_id, relation="NEXT_MOMENT")
-        else:
-            self.graph.add_edge(self.root_node, clip_id, relation="KICKOFF")
-
-        # --- LOGIC LAYER 1: DEFENSIVE CONTEXT ---
-        # Connect clip to the number of defenders (Tactical State)
-        # 6-7 Players = Full House (Safe)
-        # 1-3 Players = Super Tackle Opportunity (High Risk/High Reward)
-        situation_node = f"Sit_{player_count}_Players"
-        situation_label = f"{player_count} Defenders"
-        
-        if player_count <= 3 and player_count > 0:
-            situation_node += "_SuperTackle_On"
-            situation_label += " (Super Tackle ON)"
-            self.graph.add_node(situation_node, type="Context", color="red", layer=3)
-        else:
-            self.graph.add_node(situation_node, type="Context", color="gray", layer=3)
-            
-        self.graph.add_edge(clip_id, situation_node, relation="DEFENSE_STATE")
-
-        # --- LOGIC LAYER 2: EVENT CLASSIFICATION ---
-        event_node = None
-        event_label = "Unknown"
-        
-        # Keywords
-        has_point = any(x in text_lower for x in ["point", "touch", "hand", "toe"])
-        has_tackle = any(x in text_lower for x in ["tackle", "caught", "dash", "block"])
-        has_bonus = "bonus" in text_lower
-        has_review = "review" in text_lower or "challenge" in text_lower
-        
-        if has_review:
-            event_label = "DRS Review"
-            event_node = f"Evt_{clip_id}_Review"
-        elif "super tackle" in text_lower:
-            event_label = "SUPER TACKLE (+2)"
-            event_node = f"Evt_{clip_id}_SuperTackle"
-        elif "all out" in text_lower:
-            event_label = "ALL OUT (+2)"
-            event_node = f"Evt_{clip_id}_AllOut"
-        elif has_tackle:
-            event_label = "Successful Tackle"
-            event_node = f"Evt_{clip_id}_Tackle"
-        elif is_raid_vision:
-            if has_point:
-                event_label = "Scoring Raid"
-                event_node = f"Evt_{clip_id}_RaidScore"
-            elif has_bonus:
-                event_label = "Bonus Point"
-                event_node = f"Evt_{clip_id}_Bonus"
-            else:
-                event_label = "Empty Raid"
-                event_node = f"Evt_{clip_id}_EmptyRaid"
-                
-        # --- LOGIC LAYER 3: TEAM ATTRIBUTION ---
-        # Check who is mentioned in the commentary
-        involved_team = None
-        if self.team_a.lower() in text_lower:
-            involved_team = self.team_a
-        elif self.team_b.lower() in text_lower:
-            involved_team = self.team_b
-            
-        # --- GRAPH CONSTRUCTION ---
-        if event_node:
-            self.graph.add_node(event_node, type="Event", label=event_label, layer=4)
-            self.graph.add_edge(clip_id, event_node, relation="HAS_EVENT")
-            
-            # Link Event to Concept (Hub)
-            concept = f"Concept_{event_label.split()[0]}"
-            self.graph.add_node(concept, type="Concept", layer=5)
-            self.graph.add_edge(event_node, concept, relation="INSTANCE_OF")
-            
-            # Link Event to Team (if known)
-            if involved_team:
-                self.graph.add_edge(involved_team, event_node, relation="EXECUTED_BY")
-
-    def build_from_directories(self, json_dir, txt_dir):
-        files = [f for f in os.listdir(json_dir) if f.endswith('.json')]
-        files.sort(key=self.natural_sort_key)
-        
-        print(f"Constructing Deep Tactical Graph from {len(files)} clips...")
-        prev_clip = None
-        
-        for file in files:
-            json_path = os.path.join(json_dir, file)
-            txt_path = os.path.join(txt_dir, file.replace('.json', '.txt'))
-            
-            with open(json_path, 'r') as f: vision = json.load(f)
-            
-            transcript = ""
-            if os.path.exists(txt_path):
-                with open(txt_path, 'r', encoding='utf-8') as f: transcript = f.read().strip()
-                
-            clip_id = vision['video_file']
-            self.add_clip_logic(clip_id, vision, transcript, prev_clip)
-            prev_clip = clip_id
-            
-        print(f"Deep Graph Complete! Nodes: {self.graph.number_of_nodes()} | Edges: {self.graph.number_of_edges()}")
-
-    def visualize(self, output_file="kabaddi_graph_deep.png"):
-        plt.figure(figsize=(20, 14))
-        
-        # Define Layers for Layout (Hierarchical)
-        pos = nx.spring_layout(self.graph, k=2, iterations=100)
-        
-        node_colors = []
-        node_sizes = []
-        labels = {}
-        
-        for node, attr in self.graph.nodes(data=True):
-            n_type = attr.get("type", "Unknown")
-            label = attr.get("label", node)
-            
-            # Custom Styling
-            if n_type == "Match": 
-                node_colors.append("#FFD700") # Gold
-                node_sizes.append(3000)
-                labels[node] = label
-            elif n_type == "Team": 
-                node_colors.append("#FFA500") # Orange
-                node_sizes.append(2500)
-                labels[node] = label
-            elif n_type == "VideoClip": 
-                node_colors.append("#87CEEB") # Sky Blue
-                node_sizes.append(1000)
-                labels[node] = node[:7] # Short label
-            elif n_type == "Context": 
-                node_colors.append("#FF6961") # Red/Gray
-                node_sizes.append(1200)
-                labels[node] = label
-            elif n_type == "Event": 
-                node_colors.append("#90EE90") # Light Green
-                node_sizes.append(1500)
-                labels[node] = label
-            else: 
-                node_colors.append("#D3D3D3")
-                node_sizes.append(500)
-                labels[node] = ""
-
-        nx.draw_networkx_nodes(self.graph, pos, node_size=node_sizes, node_color=node_colors, alpha=0.9, edgecolors='white')
-        nx.draw_networkx_edges(self.graph, pos, edge_color='#888888', arrows=True, width=1.5, alpha=0.6)
-        nx.draw_networkx_labels(self.graph, pos, labels, font_size=9, font_weight="bold")
-        
-        plt.title("Kabaddi-Neuro: Deep Tactical Knowledge Graph", fontsize=16)
-        plt.axis('off')
-        plt.savefig(output_file, dpi=300, bbox_inches='tight')
-        print(f"Visualization saved to {output_file}")
-        plt.close()
+            plt.figure(figsize=(10, 6))
+            pos = nx.spring_layout(self.G, k=0.5, iterations=50)
+            color_map = []
+            for node in self.G:
+                ntype = self.G.nodes[node].get("type", "unknown")
+                if ntype == "clip": color_map.append('#87CEFA')   
+                elif ntype == "tactic": color_map.append('#FFA500') 
+                elif ntype == "state": color_map.append('#90EE90')  
+                elif ntype == "event": color_map.append('#FF6347')  
+                elif ntype == "zone": color_map.append('#FFFF00')  
+                else: color_map.append('grey')
+            nx.draw(self.G, pos, node_color=color_map, with_labels=True, font_size=8, node_size=800, alpha=0.9, edge_color='gray')
+            plt.title("Kabaddi Match Tactical Topology")
+            plt.savefig(output_path)
+            plt.close()
+            return output_path
+        except Exception as e:
+            return None
 
 if __name__ == "__main__":
-    kg = KabaddiGraph()
-    kg.build_from_directories("data/metadata", "data/transcripts")
-    kg.visualize()
+    pass

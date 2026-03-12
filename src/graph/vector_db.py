@@ -9,7 +9,6 @@ import time
 class KabaddiVectorDB:
     def __init__(self, db_path="data/chroma_db"):
         self.db_path = db_path
-        # Suppressed init print for cleaner UI logs
         self.client = chromadb.PersistentClient(path=db_path)
         self.embedding_fn = embedding_functions.DefaultEmbeddingFunction()
         
@@ -45,9 +44,7 @@ class KabaddiVectorDB:
         return valid_sentences
 
     def ingest_rulebook(self, pdf_path, callback=None):
-        if not os.path.exists(pdf_path):
-            if callback: callback({"type": "log", "msg": f"❌ Rulebook not found: {pdf_path}"})
-            return
+        if not os.path.exists(pdf_path): return
 
         if callback: callback({"type": "log", "msg": f"📘 Ingesting Rulebook: {os.path.basename(pdf_path)}..."})
         
@@ -69,12 +66,7 @@ class KabaddiVectorDB:
 
                     self.collection.upsert(
                         documents=[sentence],
-                        metadatas=[{
-                            "type": "rule", 
-                            "source": "official_pdf", 
-                            "page": i+1,
-                            "chunk_id": j
-                        }],
+                        metadatas=[{"type": "rule", "source": "official_pdf", "page": i+1}],
                         ids=[doc_id]
                     )
                     total_sentences += 1
@@ -94,15 +86,13 @@ class KabaddiVectorDB:
         visuals = data.get("visual_context", {})
         audio = data.get("audio_context", {})
         metrics = visuals.get("tactical_metrics", {})
+        zonal = visuals.get("zonal_analysis", {})
         
-        # --- 1. NATURAL LANGUAGE TRANSLATION ---
-        # Instead of just storing raw numbers, we create sentences that match 
-        # how a human would ask questions.
-        
+        # --- 1. VISUAL/TACTICAL TRANSLATION ---
         scene_desc = visuals.get('scene_class', 'Unknown Scene')
         is_raid_str = "This is an active raid." if visuals.get('is_raid') else "This is a defensive setup."
         
-        # Defender Count Logic (The Fix)
+        # Defender Logic
         def_count = metrics.get('defender_pack_size', 0)
         def_str = f"There are {def_count} defenders active on the court."
         if def_count == 7:
@@ -117,24 +107,64 @@ class KabaddiVectorDB:
         # Audio
         transcript = audio.get('transcript', "")
         ref_events = ", ".join(audio.get('referee_events', []))
+        full_audio = f"{ref_events} {transcript}".lower()
         
-        # Construct the FINAL Searchable Text
+        # --- 2. EXPLICIT OUTCOME INFERENCE (THE FIX) ---
+        outcome_contexts = []
+        
+        if "raider safe" in full_audio or "safe" in full_audio:
+            if "ceg" in full_audio:
+                outcome_contexts.append("CEG raider performed successful raid. ACTECH's defense failed. ACTECH's defense failure. CEG's raid success.")
+            elif "actech" in full_audio:
+                outcome_contexts.append("ACTECH raider performed successful raid. CEG's defense failed. CEG's defense failure. ACTECH's raid success.")
+                
+        elif "raider out" in full_audio or "out" in full_audio:
+            if "ceg" in full_audio:
+                outcome_contexts.append("CEG's defense succeeded. ACTECH's raid failed. ACTECH's raider failure. CEG's defense success.")
+            elif "actech" in full_audio:
+                outcome_contexts.append("ACTECH's defense succeeded. CEG's raid failed. CEG's raider failure. ACTECH's defense success.")
+                
+        if "bonus" in full_audio:
+            if "ceg" in full_audio:
+                outcome_contexts.append("CEG scored a bonus point. ACTECH's defense failed. ACTECH's defense failure.")
+            elif "actech" in full_audio:
+                outcome_contexts.append("ACTECH scored a bonus point. CEG's defense failed. CEG's defense failure.")
+
+        outcome_str = " ".join(outcome_contexts) if outcome_contexts else "Outcome is standard or unclear."
+
+        # --- 3. ZONAL ANALYSIS INTEGRATION ---
+        zonal_str = ""
+        if zonal:
+            baulk_prox = zonal.get("baulk_line_proximity", {})
+            court_dist = zonal.get("court_distribution_percentages", {})
+            timeline = zonal.get("raider_trajectory_timeline", [])
+            
+            zonal_str = f"Raider spent {baulk_prox.get('time_spent_past_baulk_line_sec', 0)} seconds past the baulk line reaching a depth of {baulk_prox.get('deepest_penetration_px', 0)} pixels. "
+            if court_dist:
+                highest_zone = max(court_dist, key=court_dist.get)
+                zonal_str += f"The primary attacking zone was the {highest_zone.replace('_', ' ')}. "
+            if timeline:
+                actions = ", ".join([f"{t.get('action', 'moving')} in {t.get('zone', 'zone')}" for t in timeline])
+                zonal_str += f"Trajectory sequence: {actions}."
+
+        # --- 4. CONSTRUCT THE FINAL SEARCHABLE TEXT ---
         searchable_text = (
             f"Clip ID: {clip_id}.\n"
             f"{scene_desc}. {is_raid_str}\n"
-            f"{def_str}\n"  # <--- This sentence is what your query will match against
+            f"{def_str}\n"
             f"{attack_str}\n"
+            f"Explicit Match Outcome: {outcome_str}\n" 
             f"Tactical Data: Formation Density is {metrics.get('formation_density_index')}. "
             f"Raider Intensity is {metrics.get('raider_movement_intensity')}.\n"
+            f"Zonal Stats: {zonal_str}\n"
             f"Commentary: {transcript}.\n"
             f"Referee Calls: {ref_events}."
         )
         
-        # Deep Dive Log
         if callback:
             callback({
                 "type": "deep_log", 
-                "msg": f"🧠 Encoding [{clip_id}]: \"{def_str} | {attack_str}\""
+                "msg": f"🧠 [Combined DB Context] {clip_id}: \"{def_str} | {attack_str} | {outcome_str}\""
             })
 
         self.collection.upsert(
@@ -142,8 +172,9 @@ class KabaddiVectorDB:
             metadatas=[{
                 "type": "gameplay_clip", 
                 "filename": clip_id,
-                "defenders": def_count, # Stored as int for filtering
-                "raid": visuals.get('is_raid')
+                "defenders": def_count,
+                "raid": visuals.get('is_raid'),
+                "has_bonus": "bonus" in full_audio
             }],
             ids=[clip_id]
         )
@@ -164,8 +195,35 @@ class KabaddiVectorDB:
         if callback: callback({"type": "log", "msg": "✅ Vector Database Optimized & Ready."})
 
     def search(self, query, category="all", n_results=3):
-        # Default search behavior
-        pass
+        try:
+            where_clause = None
+            if category == "rule":
+                where_clause = {"type": "rule"}
+            elif category == "match":
+                where_clause = {"type": "gameplay_clip"}
+
+            query_params = {
+                "query_texts": [query],
+                "n_results": n_results
+            }
+            if where_clause:
+                query_params["where"] = where_clause
+
+            results = self.collection.query(**query_params)
+            
+            structured_results = []
+            if results and 'documents' in results and len(results['documents'][0]) > 0:
+                for i in range(len(results['documents'][0])):
+                    doc = results['documents'][0][i]
+                    meta = results['metadatas'][0][i]
+                    structured_results.append({
+                        "text": doc,
+                        "metadata": meta
+                    })
+            return structured_results
+        except Exception as e:
+            print(f"Vector DB Search Error: {e}")
+            return []
 
 if __name__ == "__main__":
     vdb = KabaddiVectorDB()

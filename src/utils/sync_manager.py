@@ -69,6 +69,7 @@ class SyncManager:
             # 3. ALIGNMENT LOGIC
             classification = vision_data.get("classification", {})
             stats = vision_data.get("stats", {})
+            zonal = vision_data.get("zonal_analysis", {}) # Fetch the Zonal block
             
             # Deep Dive: Show the fusion
             if callback: 
@@ -86,7 +87,8 @@ class SyncManager:
                     "scene_class": classification.get("scene_type", "Unknown"),
                     "is_raid": classification.get("is_raid_likely", False),
                     "max_players": vision_data.get("max_players_visible", 0),
-                    "tactical_metrics": stats 
+                    "tactical_metrics": stats,
+                    "zonal_analysis": zonal # Make sure Zonal gets synced to output
                 },
                 "audio_context": {
                     "transcript": audio_parsed["full_transcript"],

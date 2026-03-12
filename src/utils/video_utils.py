@@ -1,132 +1,136 @@
-import cv2
 import os
-import sys
 import subprocess
-import imageio_ffmpeg # This comes installed with moviepy
+import numpy as np
+import librosa
+import imageio_ffmpeg
 
 class VideoProcessor:
     def __init__(self, threshold=0.5):
         self.threshold = threshold
-        # Get the actual path to the ffmpeg.exe installed on your system
         self.ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
         print(f"✅ Using FFmpeg binary at: {self.ffmpeg_path}")
 
-    def detect_scenes(self, video_path, output_dir, callback=None):
-        if not os.path.exists(output_dir):
-            os.makedirs(output_dir)
+    def extract_audio(self, video_path, audio_path):
+        """Extracts audio from video for analysis using FFmpeg."""
+        cmd = [
+            self.ffmpeg_path, "-y",
+            "-i", video_path,
+            "-vn", "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "1",
+            audio_path
+        ]
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
-        # --- PHASE 1: ANALYSIS (Using OpenCV) ---
-        cap = cv2.VideoCapture(video_path)
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    def detect_whistle_timestamps(self, audio_path, callback=None):
+        """
+        Analyzes audio to find whistles and streams EXACT FREQUENCY values.
+        """
+        if callback: callback({"type": "log", "msg": "📊 Loading Audio for Frequency Analysis..."})
         
-        prev_hist = None
-        prev_frame = None 
-        frame_idx = 0
-        scene_start_time = 0.0
+        y, sr = librosa.load(audio_path, sr=44100)
         
-        cut_list = []
-        evidence_count = 0 
+        # STFT
+        D = np.abs(librosa.stft(y))
+        frequencies = librosa.fft_frequencies(sr=sr)
         
-        if callback: callback({"type": "log", "msg": f"Phase 1: Scanning {total_frames} frames..."})
+        # Define Whistle Band (2000Hz - 5000Hz)
+        whistle_band_mask = (frequencies > 2000) & (frequencies < 5000)
+        band_frequencies = frequencies[whistle_band_mask]
+        
+        # Calculate Energy Profile
+        whistle_energy = np.mean(D[whistle_band_mask, :], axis=0)
+        background_energy = np.mean(D, axis=0) + 1e-6
+        ratio = whistle_energy / background_energy
+        ratio_smooth = np.convolve(ratio, np.ones(10)/10, mode='same')
+        
+        # --- NEW: DOMINANT FREQUENCY EXTRACTION ---
+        # For every timeframe, find which Frequency (Hz) is the loudest
+        band_magnitudes = D[whistle_band_mask, :]
+        peak_freq_indices = np.argmax(band_magnitudes, axis=0)
+        dominant_freqs = band_frequencies[peak_freq_indices]
 
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
+        # Thresholding
+        dynamic_thresh = max(3.0, np.mean(ratio_smooth) * 2)
+        peaks = np.where(ratio_smooth > dynamic_thresh)[0]
+        times = librosa.frames_to_time(peaks, sr=sr)
+        
+        detected_timestamps = []
+        if len(times) > 0:
+            last_time = times[0]
+            detected_timestamps.append(last_time)
             
-            # Histogram Calculation
-            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-            hist = cv2.calcHist([hsv], [0, 1], None, [50, 60], [0, 180, 0, 256])
-            cv2.normalize(hist, hist, 0, 1, cv2.NORM_MINMAX)
+            for i, t in enumerate(times):
+                frame_idx = peaks[i]
+                current_freq = dominant_freqs[frame_idx] # The exact Hz
+                current_conf = ratio_smooth[frame_idx]
 
-            if prev_hist is not None:
-                similarity = cv2.compareHist(prev_hist, hist, cv2.HISTCMP_CORREL)
-
-                if similarity < self.threshold:
-                    current_time = frame_idx / fps
+                if (t - last_time) > 2.0: # Debounce
+                    detected_timestamps.append(t)
+                    last_time = t
                     
-                    if (current_time - scene_start_time) > 2.0:
-                        cut_list.append((scene_start_time, current_time))
-                        
-                        # --- CAPTURE EVIDENCE (First 4 Cuts) ---
-                        if evidence_count < 4:
-                            frame_A_path = os.path.join(output_dir, f"evidence_{evidence_count}_A.jpg")
-                            frame_B_path = os.path.join(output_dir, f"evidence_{evidence_count}_B.jpg")
-                            
-                            cv2.imwrite(frame_A_path, prev_frame)
-                            cv2.imwrite(frame_B_path, frame)
-                            
-                            if callback: 
-                                callback({
-                                    "type": "cut_evidence", 
-                                    "time": current_time, 
-                                    "score": similarity,
-                                    "frame_A": frame_A_path,
-                                    "frame_B": frame_B_path,
-                                    "msg": f"✂️ **CUT DETECTED** at {current_time:.2f}s"
-                                })
-                            evidence_count += 1
-                        else:
-                            if callback:
-                                callback({
-                                    "type": "log", 
-                                    "msg": f"✂️ Cut detected at {current_time:.2f}s"
-                                })
-                        
-                        scene_start_time = current_time
-
-            prev_hist = hist
-            prev_frame = frame.copy()
-            frame_idx += 1
-
-        # Add the final scene
-        final_time = frame_idx / fps
-        if (final_time - scene_start_time) > 2.0:
-            cut_list.append((scene_start_time, final_time))
-
-        cap.release()
+                    # STREAM LIVE NUMBERS (Step 1 Request)
+                    if callback:
+                        callback({
+                            "type": "whistle_detected",
+                            "time": t,
+                            "freq": int(current_freq),  # e.g., 3450 Hz
+                            "confidence": float(current_conf),
+                            "msg": f"📢 Whistle: {int(current_freq)} Hz (Conf: {current_conf:.1f})"
+                        })
         
-        # --- PHASE 2: EXTRACTION (Using Raw Subprocess) ---
-        if callback: callback({"type": "log", "msg": f"Phase 2: Saving {len(cut_list)} clips using FFmpeg Core..."})
-        
-        saved_clips_info = []
+        return detected_timestamps
 
-        for i, (start, end) in enumerate(cut_list):
-            try:
-                # Minimum duration check
-                if (end - start) < 1.0: continue
+    def detect_scenes(self, video_path, output_dir, callback=None):
+        if not os.path.exists(output_dir): os.makedirs(output_dir)
+
+        temp_audio = os.path.join(output_dir, "temp_analysis_audio.wav")
+        
+        try:
+            self.extract_audio(video_path, temp_audio)
+            whistle_times = self.detect_whistle_timestamps(temp_audio, callback)
+            
+            cut_list = []
+            start_time = 0.0
+            
+            for w_time in whistle_times:
+                end_time = w_time + 5.0 
+                cut_list.append((start_time, end_time))
+                start_time = end_time 
+            
+            cut_list.append((start_time, start_time + 30.0)) 
+
+            if callback: callback({"type": "log", "msg": f"💾 Saving {len(cut_list)} clips..."})
+            
+            saved_clips_info = []
+
+            for i, (start, end) in enumerate(cut_list):
+                duration = end - start
+                if duration < 1.0: continue
 
                 filename = f"clip_{i}.mp4"
                 output_filename = os.path.join(output_dir, filename)
 
-                # BUILD THE COMMAND
-                # We call ffmpeg.exe directly. This bypasses Python's memory entirely.
                 cmd = [
-                    self.ffmpeg_path,
-                    "-y",              # Overwrite without asking
-                    "-ss", str(start), # Seek to start time
-                    "-i", video_path,  # Input file
-                    "-t", str(end - start), # Duration to cut
-                    "-c:v", "libx264", # Re-encode video for stability
-                    "-c:a", "aac",     # Re-encode audio
-                    "-preset", "ultrafast", # Speed up encoding
-                    "-loglevel", "error",   # Quiet output unless error
+                    self.ffmpeg_path, "-y",
+                    "-ss", f"{start:.2f}",
+                    "-i", video_path,
+                    "-t", f"{duration:.2f}",
+                    "-c:v", "libx264", "-c:a", "aac",
+                    "-preset", "ultrafast",
+                    "-loglevel", "error",
                     output_filename
                 ]
 
-                # EXECUTE
-                # This creates a completely new process for this one clip.
-                # When it finishes, Windows automatically cleans up 100% of the resources.
                 subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-                
                 saved_clips_info.append({"Clip": filename, "Start": start, "End": end})
                 
-            except subprocess.CalledProcessError as e:
-                print(f"FFmpeg Error on clip {i}")
-                if callback: callback({"type": "log", "msg": f"❌ Error saving clip {i}"})
-            except Exception as e:
-                print(f"General Error on clip {i}: {e}")
+                if callback:
+                    callback({"type": "progress", "clip": i, "status": "Saved"})
 
-        if callback: callback({"type": "log", "msg": "✅ All clips saved successfully."})
-        return saved_clips_info
+            if callback: callback({"type": "log", "msg": "✅ Whistle Segregation Complete."})
+            return saved_clips_info
+
+        except Exception as e:
+            if callback: callback({"type": "log", "msg": f"❌ Error: {e}"})
+            return []
+        finally:
+            if os.path.exists(temp_audio): os.remove(temp_audio)

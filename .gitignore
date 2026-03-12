@@ -1,0 +1,9 @@
+data/
+*.mp4
+*.pt
+*.pth
+*.jpg
+*.png
+*.sqlite3
+__pycache__/
+*.pyc
