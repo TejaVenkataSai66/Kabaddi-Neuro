@@ -74,21 +74,3 @@ Start Processing: Click the Start Full Processing button. The dashboard will liv
 
 Ask the AI Coach: Once processing is complete, use the search bar at the bottom to ask tactical questions (e.g., "Why did the raider fail on the left flank?" or "Analyze the defensive formation density."). The system will return the relevant video clip, a textual analysis, and dynamic Plotly charts.
 
-📂 Project Structure
-Plaintext
-Kabaddi-Neuro/
-├── data/                       # Directory for raw videos, processed clips, and unified JSONs
-├── src/
-│   ├── agents/
-│   │   ├── vision_agent.py     # YOLOv8 and ResNet logic
-│   │   ├── audio_agent.py      # Whisper transcription and phonetic filtering
-│   │   └── reasoning_agent.py  # LLM prompt engineering and response generation
-│   ├── graph/
-│   │   ├── vector_db.py        # ChromaDB setup and search logic
-│   │   └── knowledge_graph.py  # NetworkX topology and global outcome tracking
-│   └── utils/
-│       ├── video_utils.py      # FFmpeg whistle detection and clipping
-│       └── sync_manager.py     # Merges audio and visual data into Unified JSON
-├── demo_ui.py                  # Main Streamlit Dashboard
-├── requirements.txt            # Python dependencies
-└── .env                        # API keys and environment variables
