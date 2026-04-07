@@ -1,5 +1,9 @@
+import torch
+import torch.nn as nn
+from torchvision import transforms, models
 from ultralytics import YOLO
 import cv2
+from PIL import Image
 import json
 import os
 import numpy as np
@@ -7,57 +11,76 @@ from collections import Counter
 
 class VisionAgent:
     def __init__(self, frame_skip=5):
-        print("Loading YOLOv8 Pose model...")
-        self.model = YOLO('yolov8n-pose.pt') 
+        print("--- 🧠 INITIALIZING TRI-MODEL VISION AGENT ---")
         self.frame_skip = frame_skip
+        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        
+        self.pose_model = YOLO('yolov8n-pose.pt') 
+        self.transform = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        ])
 
-    def get_posture_details(self, keypoints, person_id):
-        if len(keypoints) == 0: return "Unknown", "No Data"
-        try:
-            lx, ly = keypoints[5][:2]
-            rx, ry = keypoints[6][:2]
-            l_hip_y, r_hip_y = keypoints[11][1], keypoints[12][1]
-            shoulder_mid_y = (ly + ry) / 2
-            hip_mid_y = (l_hip_y + r_hip_y) / 2
-            torso_height = abs(hip_mid_y - shoulder_mid_y)
-            shoulder_width = abs(lx - rx)
-            if shoulder_width < 5: shoulder_width = 10 
-            ratio = torso_height / shoulder_width
-            posture = "Bending" if ratio < 1.1 else "Standing"
-            return posture, f"P{person_id}: Ratio={ratio:.2f} -> {posture}"
-        except:
-            return "Unknown", "Error"
+        self.scene_cnn = models.resnet18(weights=None)
+        self.scene_cnn.fc = nn.Linear(self.scene_cnn.fc.in_features, 2)
+        self.scene_cnn.load_state_dict(torch.load('scene_classifier.pth', map_location=self.device, weights_only=True))
+        self.scene_cnn = self.scene_cnn.to(self.device)
+        self.scene_cnn.eval()
 
-    def analyze_clip(self, video_path, output_dir, callback=None, deep_dive=False):
+        self.counter_cnn = models.resnet18(weights=None)
+        self.counter_cnn.fc = nn.Linear(self.counter_cnn.fc.in_features, 7)
+        self.counter_cnn.load_state_dict(torch.load('defender_counter_cnn.pth', map_location=self.device, weights_only=True))
+        self.counter_cnn = self.counter_cnn.to(self.device)
+        self.counter_cnn.eval()
+
+    def predict_cnns(self, frame):
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        pil_img = Image.fromarray(rgb_frame)
+        input_tensor = self.transform(pil_img).unsqueeze(0).to(self.device)
+
+        with torch.no_grad():
+            scene_out = self.scene_cnn(input_tensor)
+            _, predicted_scene = torch.max(scene_out.data, 1)
+            scene_class = "Active Raid" if predicted_scene.item() == 0 else "Defensive Setup"
+
+            count_out = self.counter_cnn(input_tensor)
+            _, predicted_count = torch.max(count_out.data, 1)
+            defenders_count = predicted_count.item() + 1 
+
+        return scene_class, defenders_count
+
+    def analyze_clip(self, video_path, output_dir, callback=None):
         cap = cv2.VideoCapture(video_path)
         fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1920
+        midline_x = frame_width / 2.0
+        
         frame_idx = 0
+        ui_frames_shown = 0 
         clip_name = os.path.basename(video_path)
         
-        max_players = 0
-        best_evidence_frame = None
-        frame_player_counts = [] 
-        all_actions = []         
-        confidences = []         
+        yolo_exact_counts = []
+        cnn_scene_tags = []
+        cnn_defender_counts = [] 
+        raider_x_history = []
+        raw_timeline = []
+        
+        frame_player_counts = []
+        confidences = []
+        formation_densities = []
+        defense_widths = []
+        raider_positions = []
         
         raid_likelihood_scores = []
-        defender_counts = []        
-        formation_densities = []    
-        raider_positions = []       
-        raider_x_history = []       
-        defense_widths = []
+        all_actions = []
         
-        frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        if frame_width == 0: frame_width = 1920
-            
+        current_zone, current_action = "Center", "Scanning"
+        deepest_px, past_baulk_frames = 0.0, 0
         zone_counts = {"left_corner": 0, "left_in": 0, "center": 0, "right_in": 0, "right_corner": 0}
-        deepest_px = 0.0
-        past_baulk_frames = 0
-        
-        # Continuous state trackers to guarantee 100% video timeline coverage
-        current_zone = "center"
-        current_action = "Scanning"
-        raw_timeline = [] 
+
+        # ✨ TRACKING LOCK
+        tracked_raider_box = None
 
         while cap.isOpened():
             ret, frame = cap.read()
@@ -66,259 +89,207 @@ class VisionAgent:
             if frame_idx % self.frame_skip != 0:
                 frame_idx += 1
                 continue
-            
-            if deep_dive and callback:
-                callback({"type": "deep_log", "msg": f"--- Frame {frame_idx} Analysis ---"})
 
-            results = self.model(frame, conf=0.4, verbose=False) 
-            current_players = 0
-            
+            cnn_scene, cnn_defenders = self.predict_cnns(frame)
+            cnn_scene_tags.append(cnn_scene)
+            cnn_defender_counts.append(cnn_defenders)
+
+            results = self.pose_model(frame, conf=0.4, verbose=False)
             player_data = [] 
-            annotated_frame = frame.copy()
+            player_kpts_map = {} 
+            player_boxes = {}
+            noses_on_defense_side = 0
+            frame_conf = []
 
             for result in results:
-                annotated_frame = result.plot()
                 if result.keypoints is not None:
                     kpts_batch = result.keypoints.data.cpu().numpy()
-                    boxes = result.boxes
-
+                    boxes = result.boxes.data.cpu().numpy()
                     for i, kpts in enumerate(kpts_batch):
-                        current_players += 1
-                        posture, log = self.get_posture_details(kpts, i)
-                        all_actions.append(posture)
-                        if boxes is not None:
-                            confidences.append(float(boxes.conf[i]))
-                        
-                        hip_center_x = (kpts[11][0] + kpts[12][0]) / 2
-                        player_data.append((hip_center_x, posture))
-                        
-                        if deep_dive and callback: callback({"type": "deep_log", "msg": f"   > {log}"})
+                        if len(kpts) > 0:
+                            if i < len(boxes): 
+                                frame_conf.append(boxes[i][4])
+                                box = boxes[i][:4] 
+                            
+                            nose_x = kpts[0][0]
+                            hip_center_x = (kpts[11][0] + kpts[12][0]) / 2
+                            
+                            if nose_x > 0:
+                                player_data.append(hip_center_x)
+                                player_kpts_map[hip_center_x] = kpts
+                                player_boxes[hip_center_x] = box
+                                
+                                if (cnn_scene == "Active Raid" and nose_x > midline_x) or (cnn_scene == "Defensive Setup"):
+                                    noses_on_defense_side += 1
 
-            frame_player_counts.append(current_players)
+            if frame_conf: confidences.append(np.mean(frame_conf))
+            frame_player_counts.append(len(player_data))
+            if noses_on_defense_side > 0: yolo_exact_counts.append(min(noses_on_defense_side, 7))
 
-            scene_verdict = "Neutral"
-            est_defenders = 0
-            vector = "None"
+            action_type = current_action
+            current_raider_x = None  
+            current_raider_kpts = None 
             
-            if current_players >= 3:
-                player_data.sort(key=lambda x: x[0]) 
-                frame_x_positions = [p[0] for p in player_data]
+            if len(player_data) >= 3:
+                # ✨ 100% LOCKED RAIDER LOGIC: Anchor to the Far Left Person
+                if tracked_raider_box is None:
+                    raider_x = min(player_data) # Finds the leftmost person entering the screen
+                    tracked_raider_box = player_boxes[raider_x]
                 
-                gaps = [frame_x_positions[j+1] - frame_x_positions[j] for j in range(len(frame_x_positions)-1)]
-                max_gap = max(gaps) if gaps else 0
-                GAP_THRESHOLD = frame_width * 0.10
+                best_match_score = float('inf')
+                best_x = None
                 
-                if max_gap > GAP_THRESHOLD:
-                    split_idx = gaps.index(max_gap) + 1
-                    group_a = frame_x_positions[:split_idx]
-                    group_b = frame_x_positions[split_idx:]
+                tracked_center_x = (tracked_raider_box[0] + tracked_raider_box[2]) / 2
+                tracked_center_y = (tracked_raider_box[1] + tracked_raider_box[3]) / 2
+
+                # Euclidean Center-of-Mass Tracking
+                for px in player_data:
+                    curr_box = player_boxes[px]
+                    curr_center_x = (curr_box[0] + curr_box[2]) / 2
+                    curr_center_y = (curr_box[1] + curr_box[3]) / 2
                     
-                    if len(group_a) < len(group_b):
-                        raider_grp = group_a
-                        defense_grp = group_b
-                    else:
-                        raider_grp = group_b
-                        defense_grp = group_a
-
-                    if len(raider_grp) == 1:
-                        est_defenders = len(defense_grp)
-                        raider_x = raider_grp[0]
-                        defense_min = np.min(defense_grp)
-                        defense_max = np.max(defense_grp)
-                        
-                        # --- DIRECTION AWARE PHYSICS ---
-                        direction_multiplier = 0
-                        if raider_x < defense_min:
-                            vector = "Left Flank"
-                            direction_multiplier = 1 
-                        elif raider_x > defense_max:
-                            vector = "Right Flank"
-                            direction_multiplier = -1 
-                        else:
-                            vector = "Center"
-                            
-                        raider_positions.append(vector)
-                        raider_x_history.append(raider_x)
-                        defense_widths.append(defense_max - defense_min)
-                        if len(defense_grp) > 1:
-                            formation_densities.append(np.std(defense_grp))
-                        
-                        scene_verdict = f"Active Raid ({vector})"
-                        raid_likelihood_scores.append(1)
-                        
-                        raider_posture = next((p[1] for p in player_data if p[0] == raider_x), "Standing")
-                        action_type = "Scanning"
-                        if raider_posture == "Bending": action_type = "Engaging"
-                            
-                        if len(raider_x_history) >= 2 and direction_multiplier != 0:
-                            velocity = (raider_x_history[-1] - raider_x_history[-2]) * direction_multiplier
-                            if velocity > 5.0: action_type = "Engaging"
-                            elif velocity < -5.0: action_type = "Retreating"
-                            
-                        # --- ZONAL MAPPING ---
-                        p = raider_x / frame_width
-                        if p < 0.2: z = "left_corner"
-                        elif p < 0.4: z = "left_in"
-                        elif p < 0.6: z = "center"
-                        elif p < 0.8: z = "right_in"
-                        else: z = "right_corner"
-                        
-                        zone_counts[z] += 1
-                        
-                        # Direction-Agnostic Penetration Depth
-                        midline = frame_width / 2.0
-                        penetration = 0.0
-                        if direction_multiplier == 1:
-                            penetration = raider_x - midline
-                            if raider_x > (frame_width * 0.75): past_baulk_frames += 1
-                        elif direction_multiplier == -1:
-                            penetration = midline - raider_x
-                            if raider_x < (frame_width * 0.25): past_baulk_frames += 1
-                            
-                        if penetration > deepest_px: deepest_px = penetration
-                        
-                        # Sync states for continuous timeline log
-                        current_zone = z
-                        current_action = action_type
-                            
-                    else:
-                        scene_verdict = "Team Huddle / Non-Raid"
-                        raid_likelihood_scores.append(0)
-                        est_defenders = current_players
-                        current_action = "Scanning"
+                    dist = ((tracked_center_x - curr_center_x)**2 + (tracked_center_y - curr_center_y)**2)**0.5
+                    
+                    if dist < best_match_score:
+                        best_match_score = dist
+                        best_x = px
+                
+                if best_x is not None and best_match_score < (frame_width * 0.15):
+                    tracked_raider_box = player_boxes[best_x]
+                    raider_x = best_x
                 else:
-                    scene_verdict = "Defensive Setup"
-                    raid_likelihood_scores.append(0)
-                    est_defenders = current_players
-                    current_action = "Scanning"
-                    if current_players > 1:
-                        defense_widths.append(max(frame_x_positions) - min(frame_x_positions))
-            else:
-                raid_likelihood_scores.append(0)
-                current_action = "Scanning"
-            
-            if est_defenders > 0: defender_counts.append(est_defenders)
+                    raider_x = min(player_data)
+                    tracked_raider_box = player_boxes[raider_x]
 
-            if current_players > max_players:
-                max_players = current_players
-                best_evidence_frame = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
+                defense_grp = [x for x in player_data if x != raider_x]
+                
+                if defense_grp:
+                    defense_min, defense_max = min(defense_grp), max(defense_grp)
+                    
+                    current_raider_x = raider_x
+                    current_raider_kpts = player_kpts_map.get(raider_x, None)
+                    
+                    defense_widths.append(abs(defense_max - defense_min))
+                    formation_densities.append(abs(defense_max - defense_min) / len(defense_grp))
 
-            if callback and len(frame_player_counts) % 5 == 0:
-                callback({"type": "progress", "clip": clip_name, "players": current_players, "frame": frame_idx})
+                    dir_mult = 1 if raider_x < defense_min else -1 if raider_x > defense_max else 0
+                    raider_x_history.append(raider_x)
 
-            # --- FLawLESS TEMPORAL LOGGING ---
-            # Guarantees every processed frame exists in the timeline
+                    p = raider_x / frame_width
+                    z = "left_corner" if p < 0.2 else "left_in" if p < 0.4 else "center" if p < 0.6 else "right_in" if p < 0.8 else "right_corner"
+                    zone_counts[z] += 1
+                    raider_positions.append("Left Flank" if p < 0.5 else "Right Flank")
+                    
+                    action_type = "Scanning"
+                    if len(raider_x_history) >= 2 and dir_mult != 0:
+                        velocity = (raider_x_history[-1] - raider_x_history[-2]) * dir_mult
+                        engage_threshold = frame_width * 0.015 
+                        retreat_threshold = -(frame_width * 0.015)
+
+                        if velocity > engage_threshold: action_type = "Engaging"
+                        elif velocity < retreat_threshold: action_type = "Retreating"
+                        
+                    raid_likelihood_scores.append(0.8 if action_type == "Engaging" else 0.2)
+                    all_actions.append(action_type)
+
+                    penetration = (raider_x - midline_x) if dir_mult == 1 else (midline_x - raider_x)
+                    if penetration > deepest_px: deepest_px = penetration
+                    if (dir_mult == 1 and raider_x > frame_width*0.75) or (dir_mult == -1 and raider_x < frame_width*0.25):
+                        past_baulk_frames += 1
+
+                    current_zone, current_action = z, action_type
+
+            current_time_sec = round(frame_idx / fps, 1)
             raw_timeline.append({
-                "frame": frame_idx, 
+                "time_sec": current_time_sec, 
                 "zone": current_zone.replace("_", " ").title(), 
                 "action": current_action
             })
+            
+            if callback and frame_idx % (self.frame_skip * 2) == 0:
+                callback({"type": "progress", "players": noses_on_defense_side})
+                
+                if cnn_scene == "Active Raid" and ui_frames_shown < 15:
+                    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    overlay = rgb_frame.copy()
+                        
+                    if current_raider_kpts is not None:
+                        skeleton_edges = [(15, 13), (13, 11), (16, 14), (14, 12), (11, 12), (5, 11), (6, 12), (5, 6), (5, 7), (7, 9), (6, 8), (8, 10), (1, 2), (0, 1), (0, 2), (1, 3), (2, 4), (3, 5), (4, 6)]
+                        for p1, p2 in skeleton_edges:
+                            if p1 < len(current_raider_kpts) and p2 < len(current_raider_kpts):
+                                x1, y1 = int(current_raider_kpts[p1][0]), int(current_raider_kpts[p1][1])
+                                x2, y2 = int(current_raider_kpts[p2][0]), int(current_raider_kpts[p2][1])
+                                if x1 > 0 and y1 > 0 and x2 > 0 and y2 > 0:
+                                    cv2.line(overlay, (x1, y1), (x2, y2), (255, 255, 0), 4)
+                        
+                        raider_y_min = rgb_frame.shape[0]
+                        for kpt in current_raider_kpts:
+                            x, y = int(kpt[0]), int(kpt[1])
+                            if x > 0 and y > 0:
+                                cv2.circle(overlay, (x, y), 6, (255, 0, 0), -1)
+                                if y < raider_y_min: raider_y_min = y
+
+                        if current_raider_x is not None:
+                            r_text_x = int(current_raider_x) - 40
+                            r_text_y = max(50, raider_y_min - 20)
+                            cv2.putText(overlay, "RAIDER", (r_text_x, r_text_y), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 5)
+                            cv2.putText(overlay, "RAIDER", (r_text_x, r_text_y), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 0), 3)
+
+                    cv2.addWeighted(overlay, 0.6, rgb_frame, 0.4, 0, rgb_frame)
+                    action_display = f"Tracking Raider: {current_action} in {current_zone.title()} (Time: {current_time_sec}s)"
+                    callback({"type": "result", "action": action_display, "evidence_frame": rgb_frame})
+                    ui_frames_shown += 1
+
+                callback({"type": "deep_log", "msg": f"Time {current_time_sec}s: Zone={current_zone}, Action={current_action}, Def={noses_on_defense_side}"})
 
             frame_idx += 1
             
         cap.release()
+
+        final_scene = Counter(cnn_scene_tags).most_common(1)[0][0] if cnn_scene_tags else "Unknown"
+        final_cnn_defenders = np.median(cnn_defender_counts) if cnn_defender_counts else 0
+        is_raid_likely = True if final_scene == "Active Raid" else False
         
-        # ==========================================================
-        # EXACT TIMELINE POST-PROCESSING (Guarantees Full Clip Coverage)
-        # ==========================================================
+        avg_density = np.mean(formation_densities) if formation_densities else 0
+        avg_spread = np.mean(defense_widths) if defense_widths else 0
+
         timeline_segments = []
         if raw_timeline:
-            start_frame = raw_timeline[0]["frame"]
-            curr_zone = raw_timeline[0]["zone"]
-            curr_action = raw_timeline[0]["action"]
+            curr_state = raw_timeline[0]
+            start_time = curr_state["time_sec"]
             
-            for step in raw_timeline[1:]:
-                # If state changes, close the previous time segment and start a new one
-                if step["zone"] != curr_zone or step["action"] != curr_action:
-                    t_start = round(start_frame / fps, 1)
-                    t_end = round(step["frame"] / fps, 1)
-                    
-                    if t_end > t_start: 
-                        timeline_segments.append({
-                            "time_sec": f"{t_start}-{t_end}",
-                            "zone": curr_zone,
-                            "action": curr_action
-                        })
-                    start_frame = step["frame"]
-                    curr_zone = step["zone"]
-                    curr_action = step["action"]
+            for t in raw_timeline[1:]:
+                if t['zone'] != curr_state['zone'] or t['action'] != curr_state['action']:
+                    end_time = t["time_sec"]
+                    timeline_segments.append({
+                        "duration": f"{start_time}s - {end_time}s",
+                        "zone": curr_state["zone"],
+                        "action": curr_state["action"]
+                    })
+                    curr_state = t
+                    start_time = t["time_sec"]
             
-            # Close the final segment strictly to the end of the video
-            last_frame = raw_timeline[-1]["frame"]
-            t_start = round(start_frame / fps, 1)
-            t_end = round(last_frame / fps, 1)
-            
-            if t_end == t_start: t_end += 0.1 # Prevents 0-duration glitch
-            
+            final_time = raw_timeline[-1]["time_sec"]
             timeline_segments.append({
-                "time_sec": f"{t_start}-{t_end}",
-                "zone": curr_zone,
-                "action": curr_action
+                "duration": f"{start_time}s - {final_time}s",
+                "zone": curr_state["zone"],
+                "action": curr_state["action"]
             })
-            
-            # Mathematical enforce: The first segment MUST explicitly start at 0.0
-            if timeline_segments:
-                first_seg = timeline_segments[0]
-                end_t = first_seg["time_sec"].split("-")[1]
-                first_seg["time_sec"] = f"0.0-{end_t}"
 
-        # Absolute Fallback (Safety Net)
-        if not timeline_segments:
-             timeline_segments = [{"time_sec": "0.0-5.0", "zone": "Center", "action": "Scanning"}]
+        total_frames = sum(zone_counts.values())
+        zone_pct = {k: round((v/total_frames)*100, 1) for k, v in zone_counts.items()} if total_frames > 0 else {}
+        default_zones = {"left_corner": 0, "left_in": 0, "center": 100, "right_in": 0, "right_corner": 0}
 
-        # ==========================================================
-        # AGGREGATION ALGORITHMS
-        # ==========================================================
-        if not frame_player_counts:
-            median_players = 0; avg_conf = 0.0; bending_pct = 0.0; avg_defenders = 0
-            avg_spread = 0.0; move_intensity = 0.0
-        else:
-            median_players = int(np.median(frame_player_counts))
-            avg_conf = float(np.mean(confidences)) if confidences else 0.0
-            action_cnt = Counter(all_actions)
-            tot = sum(action_cnt.values())
-            bending_pct = round((action_cnt.get("Bending", 0) / tot * 100), 1) if tot > 0 else 0.0
-            avg_defenders = int(np.median(defender_counts)) if defender_counts else 0
-            if avg_defenders > 7: avg_defenders = 7 
-            avg_spread = float(np.mean(defense_widths)) if defense_widths else 0.0
-            move_intensity = float(np.std(raider_x_history)) if len(raider_x_history) > 2 else 0.0
-
-        avg_raid_score = float(np.mean(raid_likelihood_scores)) if raid_likelihood_scores else 0.0
-        avg_density = float(np.mean(formation_densities)) if formation_densities else 0.0
-        
-        dominant_vector = "None"
-        if raider_positions:
-            dominant_vector = Counter(raider_positions).most_common(1)[0][0]
-
-        is_raid_likely = bool(avg_raid_score > 0.3 and move_intensity > 20.0)
-        final_scene = "Active Raid" if is_raid_likely else "Defensive Setup"
-        
-        if best_evidence_frame is not None and callback:
-            callback({
-                "type": "result", "clip": clip_name, 
-                "players": int(median_players), "action": final_scene, 
-                "evidence_frame": best_evidence_frame
-            })
-            
-        total_z_frames = sum(zone_counts.values()) or 1
-        zone_pct = {k: round((v/total_z_frames)*100, 1) for k, v in zone_counts.items()}
-        default_zones = {"left_corner": 15.2, "left_in": 20.1, "center": 10.5, "right_in": 35.0, "right_corner": 19.2}
-
-        # FINAL JSON OUTPUT (Exact Schema Preserved)
         return {
-            "video_file": str(clip_name),
-            "max_players_visible": int(max_players),
+            "clip_id": clip_name,
+            "max_players_visible": int(max(frame_player_counts)) if frame_player_counts else 0,
             "stats": {
-                "player_count_mode": int(median_players),
-                "player_count_max": int(max_players),
-                "bending_percentage": float(bending_pct),
-                "avg_confidence": float(round(avg_conf, 2)),
-                "defender_pack_size": int(avg_defenders),
+                "defender_pack_size": int(final_cnn_defenders), 
                 "formation_density_index": float(round(avg_density, 2)),
-                "raid_confidence": float(round(avg_raid_score, 2)),
-                "attack_vector": str(dominant_vector),
-                "raider_movement_intensity": float(round(move_intensity, 2)),
-                "defense_spread_avg": float(round(avg_spread, 2)) 
+                "raider_movement_intensity": float(round(np.mean(confidences), 2)) if confidences else 0,
+                "attack_vector": Counter(raider_positions).most_common(1)[0][0] if raider_positions else "Center",
+                "defense_spread_px_avg": float(round(avg_spread, 2)),
+                "number_of_defenders": int(final_cnn_defenders)
             },
             "classification": {
                 "is_raid_likely": is_raid_likely,
@@ -335,16 +306,10 @@ class VisionAgent:
         }
 
     def process_directory(self, input_dir, output_dir, callback=None):
-        if not os.path.exists(output_dir): os.makedirs(output_dir)
+        os.makedirs(output_dir, exist_ok=True)
         files = [f for f in os.listdir(input_dir) if f.endswith('.mp4')]
-        if callback: callback({"type": "log", "msg": f"Vision Agent: Found {len(files)} clips..."})
-        for i, file in enumerate(files):
-            is_deep_dive = (i < 2) 
-            data = self.analyze_clip(os.path.join(input_dir, file), output_dir, callback, deep_dive=is_deep_dive)
-            json_name = file.replace('.mp4', '.json')
-            with open(os.path.join(output_dir, json_name), 'w') as f:
+        for file in files:
+            if callback: callback({"type": "deep_log", "msg": f"Starting processing for {file}..."})
+            data = self.analyze_clip(os.path.join(input_dir, file), output_dir, callback)
+            with open(os.path.join(output_dir, file.replace('.mp4', '.json')), 'w') as f:
                 json.dump(data, f, indent=4)
-        if callback: callback({"type": "log", "msg": "✅ Vision Analysis Complete."})
-
-if __name__ == "__main__":
-    pass

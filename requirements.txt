@@ -1,13 +1,30 @@
+# UI & Dashboards
 streamlit
+pandas
+plotly
+
+# Computer Vision
 opencv-python
 ultralytics
-openai-whisper
-langchain
-langchain-google-genai
-chromadb
-networkx
+torch
+torchvision
+
+# Audio Intelligence
+whisperx
+librosa
+soundfile
+
+# Data Processing & Video
 moviepy
-python-dotenv
-scikit-learn
-matplotlib
+imageio-ffmpeg
 numpy>=1.26.0
+
+# Knowledge Graph & Database
+networkx
+matplotlib
+chromadb
+pypdf
+
+# LLM Reasoning
+google-genai
+python-dotenv

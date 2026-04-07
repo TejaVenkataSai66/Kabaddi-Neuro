@@ -88,30 +88,25 @@ class KabaddiVectorDB:
         metrics = visuals.get("tactical_metrics", {})
         zonal = visuals.get("zonal_analysis", {})
         
-        # --- 1. VISUAL/TACTICAL TRANSLATION ---
         scene_desc = visuals.get('scene_class', 'Unknown Scene')
         is_raid_str = "This is an active raid." if visuals.get('is_raid') else "This is a defensive setup."
         
-        # Defender Logic
-        def_count = metrics.get('defender_pack_size', 0)
+        # ✨ FIXED: Using strictly 'number_of_defenders' from JSON
+        def_count = metrics.get('number_of_defenders', 0)
         def_str = f"There are {def_count} defenders active on the court."
         if def_count == 7:
             def_str += " The defense is at full strength (7 players)."
         elif def_count < 4:
             def_str += " This is a Super Tackle opportunity (less than 4 defenders)."
             
-        # Attack Logic
         attack_vec = metrics.get('attack_vector', 'None')
         attack_str = f"The raider is attacking from the {attack_vec}."
         
-        # Audio
         transcript = audio.get('transcript', "")
         ref_events = ", ".join(audio.get('referee_events', []))
         full_audio = f"{ref_events} {transcript}".lower()
         
-        # --- 2. EXPLICIT OUTCOME INFERENCE (THE FIX) ---
         outcome_contexts = []
-        
         if "raider safe" in full_audio or "safe" in full_audio:
             if "ceg" in full_audio:
                 outcome_contexts.append("CEG raider performed successful raid. ACTECH's defense failed. ACTECH's defense failure. CEG's raid success.")
@@ -132,7 +127,6 @@ class KabaddiVectorDB:
 
         outcome_str = " ".join(outcome_contexts) if outcome_contexts else "Outcome is standard or unclear."
 
-        # --- 3. ZONAL ANALYSIS INTEGRATION ---
         zonal_str = ""
         if zonal:
             baulk_prox = zonal.get("baulk_line_proximity", {})
@@ -147,7 +141,6 @@ class KabaddiVectorDB:
                 actions = ", ".join([f"{t.get('action', 'moving')} in {t.get('zone', 'zone')}" for t in timeline])
                 zonal_str += f"Trajectory sequence: {actions}."
 
-        # --- 4. CONSTRUCT THE FINAL SEARCHABLE TEXT ---
         searchable_text = (
             f"Clip ID: {clip_id}.\n"
             f"{scene_desc}. {is_raid_str}\n"

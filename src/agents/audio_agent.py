@@ -1,212 +1,396 @@
-import whisper
+"""
+audio_agent.py  –  WhisperX-based Kabaddi Referee Transcription Agent
+State Sports Board Edition (Dynamic Teams Update)
+
+Improvements:
+  - Dynamically accepts ANY team names (e.g., team1="BULLS", team2="WARRIORS").
+  - Dynamically updates Whisper's vocabulary prompt.
+  - Accepts custom phonetic alias lists to correct AI stadium hallucinations.
+  - Safely defaults to CEG/ACTECH for backward compatibility.
+"""
+
 import os
+import gc
+import re
+import time
+import logging
+
 import torch
 import soundfile as sf
-import librosa
 import numpy as np
-import time
-import re
-from moviepy import VideoFileClip
+
+try:
+    from moviepy import VideoFileClip as _VideoFileClip
+except ImportError:
+    from moviepy.editor import VideoFileClip as _VideoFileClip
+
+try:
+    import whisperx
+except ImportError as exc:
+    raise ImportError(
+        "whisperx is required.  Install it with:\n  pip install whisperx"
+    ) from exc
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("AudioAgent")
 
 class AudioAgent:
-    def __init__(self, model_size="medium"): 
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.model = whisper.load_model(model_size, device=device)
+    def __init__(
+        self,
+        model_size: str = "small",
+        language: str = "en",
+        process_full_video: bool = True,
+        tail_seconds: float = 10.0,
+        team1: str = "CEG",             # ✨ NEW: Dynamic Team 1
+        team2: str = "ACTECH",          # ✨ NEW: Dynamic Team 2
+        team1_aliases: list = None,     # ✨ NEW: Custom misspellings for Team 1
+        team2_aliases: list = None      # ✨ NEW: Custom misspellings for Team 2
+    ):
+        log.info(f"=== 🎤 Initialising WhisperX Kabaddi Agent ({team1} vs {team2}) ===")
+        self.language = language
+        self.process_full_video = process_full_video
+        self.tail_seconds = tail_seconds
 
-    def clean_audio(self, input_path, output_path):
+        # Store dynamic team names (lowercased for regex processing)
+        self.team1 = team1.lower().strip()
+        self.team2 = team2.lower().strip()
+
+        # Handle Phonetic Aliases
+        self.team1_aliases = team1_aliases or [self.team1, self.team1.replace(" ", ""), " ".join(self.team1)]
+        self.team2_aliases = team2_aliases or [self.team2, self.team2.replace(" ", ""), " ".join(self.team2)]
+
+        # Preserve the specific hardcoded misspellings for CEG/ACTECH if they are the active teams
+        if team1.upper() == "CEG" and team1_aliases is None:
+            self.team1_aliases = ["ceg", "c e g", "see gee", "seji", "cee gee", "cg", "c g"]
+        if team2.upper() == "ACTECH" and team2_aliases is None:
+            self.team2_aliases = ["actech", "ac tech", "ak tech", "ag tech", "altech", "a c tech", "attack", "active", "arctic", "ac", "a c"]
+
+        # Sort aliases by length descending so longer phrases are replaced first
+        self.team1_aliases.sort(key=len, reverse=True)
+        self.team2_aliases.sort(key=len, reverse=True)
+
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.compute_type = "float16" if self.device == "cuda" else "int8"
+        log.info("Device: %s  |  Compute: %s", self.device, self.compute_type)
+
+        # ✨ NEW: Dynamically build the prompt to bias Whisper's vocabulary
+        self.initial_prompt = (
+            f"Kabaddi referee announcement. {team1.upper()} versus {team2.upper()}. "
+            "Vocabulary: kabaddi, raider safe, raider out, bonus point, bonus plus, "
+            "super tackle, all out, all in, one point, two points, three points, "
+            f"{team1.upper()}, {team2.upper()}, lobby, do or die raid, empty raid, tackle, touch."
+        )
+
+        log.info("Loading Faster-Whisper (%s) …", model_size)
+        self.model = whisperx.load_model(
+            model_size,
+            self.device,
+            compute_type=self.compute_type,
+            language=language,
+            asr_options={
+                "initial_prompt": self.initial_prompt,
+                "beam_size": 5,
+                "best_of": 5,
+            },
+            vad_options={"vad_onset": 0.01, "vad_offset": 0.01}
+        )
+
+        log.info("Loading Wav2Vec2 alignment model …")
+        self.align_model, self.align_metadata = whisperx.load_align_model(
+            language_code=language, device=self.device
+        )
+
+        log.info("✅  Agent ready!")
+
+    def extract_audio(self, video_path: str, out_path: str = "temp_audio.wav") -> bool:
         try:
-            # 1. Load Audio at Whisper's native sample rate
-            data, rate = librosa.load(input_path, sr=16000)
-            
-            # 2. Advanced Vocal Isolation (Harmonic-Percussive Separation)
-            # This strips away crowd noise, whistle peaks, and shoe squeaks
-            S_full, phase = librosa.magphase(librosa.stft(data))
-            S_filter = librosa.decompose.nn_filter(S_full,
-                                           aggregate=np.median,
-                                           metric='cosine',
-                                           width=int(librosa.time_to_frames(2, sr=rate)))
-            S_filter = np.minimum(S_full, S_filter)
-            margin_v = 1.2
-            power_v = 2
-            mask_v = librosa.util.softmask(S_full - S_filter, margin_v * S_filter, power=power_v)
-            S_vocal = mask_v * S_full
-            vocal_audio = librosa.istft(S_vocal * phase)
-
-            # 3. EXPERT SILENCE DETECTION (Anti-Hallucination Guard)
-            # Calculate the acoustic energy. If it's too low, it's just noise.
-            rms = librosa.feature.rms(y=vocal_audio)[0]
-            mean_rms = np.mean(rms)
-            
-            # If the audio is practically silent, do not amplify it (which causes hallucinations)
-            if mean_rms < 0.005: 
-                normalized = vocal_audio
-            else:
-                max_val = np.max(np.abs(vocal_audio))
-                normalized = vocal_audio / max_val
-                
-            sf.write(output_path, normalized, rate)
-            return True, mean_rms
-        except:
-            return False, 0.0
-
-    def extract_audio_from_video(self, video_path, temp_audio_path="temp_audio.wav"):
-        try:
-            video = VideoFileClip(video_path)
-            if video.audio is None: return False
-            video.audio.write_audiofile(temp_audio_path, logger=None, nbytes=2, ffmpeg_params=["-ac", "1"])
-            video.close()
-            return True
-        except:
+            video = _VideoFileClip(video_path)
+        except Exception as exc:
+            log.error("Could not open video %s: %s", video_path, exc)
             return False
 
-    def strict_referee_filter(self, raw_text):
-        text = raw_text.lower()
-        clean_text = re.sub(r'[^\w\s]', '', text)
-        
-        # --- EXPERT PHONETIC FILTER ---
-        # Uses strict regex boundaries (\b) to prevent "on" from triggering "bonus"
-        found = {
-            "ceg": False, "actech": False, 
-            "safe": False, "out": False, 
-            "bonus": False, "point": False, 
-            "super_tackle": False, "raider": False
-        }
-        
-        # Team Names
-        if re.search(r'\b(ceg|c e g|see gee|siege|seji|cg|cd|c d)\b', clean_text): found["ceg"] = True
-        if re.search(r'\b(actech|ac tech|ak tech|ag tech|attack|active|arctic|altech|h tech)\b', clean_text): found["actech"] = True
-        
-        # Action States
-        if re.search(r'\b(safe|save|survive|escape|say)\b', clean_text): found["safe"] = True
-        if re.search(r'\b(out|catch|caught|tackle|fall|route|loud|dead)\b', clean_text): found["out"] = True
-        
-        # Scoring Events (Strictly curtailed to avoid false positives)
-        if re.search(r'\b(bonus|bonas|ponus|bouns|monus)\b', clean_text): found["bonus"] = True
-        if re.search(r'\b(point|one|won|score|coin|poin)\b', clean_text): found["point"] = True
-        if re.search(r'\b(super tackle|super catch)\b', clean_text): found["super_tackle"] = True
-        if re.search(r'\b(raider|rider|raid|player|red|right)\b', clean_text): found["raider"] = True
+        if video.audio is None:
+            log.warning("No audio stream found in %s", video_path)
+            video.close()
+            return False
 
-        # Resolve Logical Dependencies
-        team = "CEG" if found["ceg"] else ("ACTECH" if found["actech"] else "")
-        results = []
-        
-        if found["super_tackle"]:
-            results.append(f"super tackle {team}".strip())
-            
-        if found["bonus"]:
-            results.append(f"bonus point {team}".strip())
-            
-        action = ""
-        if found["safe"]: action = "raider safe"
-        elif found["out"]: action = "raider out"
-        elif found["raider"] and not found["out"]: action = "raider safe"
-        
-        if found["point"] and team and not found["bonus"] and not found["super_tackle"]:
-            if action:
-                results.append(f"{action}, one point {team}")
-            else:
-                results.append(f"one point {team}")
-        elif action and not found["bonus"] and not found["super_tackle"]:
-            results.append(action)
+        if not self.process_full_video:
+            duration = video.duration
+            if duration > self.tail_seconds:
+                try:
+                    video = video.subclipped(duration - self.tail_seconds, duration)
+                except AttributeError:
+                    video = video.subclip(duration - self.tail_seconds, duration)
+            log.info("Processing last %.1fs of clip", min(duration, self.tail_seconds))
+        else:
+            log.info("Processing full clip (%.2fs)", video.duration)
 
-        final_call = ", ".join(results)
-        
-        # Anti-Noise Filter: If no team was mentioned and the call is generic, it might be noise.
-        # We only pass it through if it's a definitive match action.
-        if not team and not action and not found["bonus"] and not found["super_tackle"]:
+        ffmpeg_params = [
+            "-ac", "1",
+            "-ar", "16000",
+        ]
+
+        try:
+            video.audio.write_audiofile(
+                out_path,
+                logger=None,
+                nbytes=2,
+                ffmpeg_params=ffmpeg_params,
+            )
+        except Exception as exc:
+            log.error("Audio write failed: %s", exc)
+            video.close()
+            return False
+        finally:
+            video.close()
+
+        return True
+
+    def parse_referee_call(self, raw_text: str) -> str:
+        if not raw_text or not raw_text.strip():
             return ""
 
-        return final_call
+        text = raw_text.lower().strip()
+        clean = re.sub(r"[^\w\s\,]", " ", text)
 
-    def analyze_clip(self, video_path, callback=None):
+        hallucinations = ["thank you", "thanks for", "subscribe", "mbn", "www", "bootball", "hey love"]
+        if any(h in clean for h in hallucinations):
+            return ""
+
+        words = clean.replace(",", "").split()
+        if len(words) > 5 and len(set(words)) == 1:
+            return ""
+
+        # ✨ NEW: Dynamic Phonetic Replacements for Team 1
+        t1_pattern = r"\b(" + "|".join([re.escape(a) for a in self.team1_aliases]) + r")\b"
+        clean = re.sub(t1_pattern, self.team1, clean)
+
+        # ✨ NEW: Dynamic Phonetic Replacements for Team 2
+        t2_pattern = r"\b(" + "|".join([re.escape(a) for a in self.team2_aliases]) + r")\b"
+        clean = re.sub(t2_pattern, self.team2, clean)
+
+        # Standard Kabaddi Terminology Replacements
+        clean = re.sub(r"\b(save|say|seif)\b", "safe", clean)
+        clean = re.sub(r"\b(aut|catch|caught|fall|route|loud|dead|ought|how|howd)\b", "out", clean)
+        clean = re.sub(r"\b(super\s+catch)\b", "super tackle", clean)
+        clean = re.sub(r"\b(bonas|ponus|bouns|monus)\b", "bonus", clean)
+        clean = re.sub(r"\b(plas|pless|place|please)\b", "plus", clean)
+        clean = re.sub(r"\b(tree)\b", "three", clean)
+        clean = re.sub(r"\b(to|too)\b", "two", clean)
+        clean = re.sub(r"\b(won|score|coin|poin|boy)\b", "point", clean)
+
+        # ✨ NEW: Dynamic phrase combinations ("point [TEAM]")
+        clean = re.sub(rf"\bpoint\s+({re.escape(self.team1)}|{re.escape(self.team2)})\b", r"one point \1", clean)
+        
+        if re.search(r"\bone\s+plus\s+two\b", clean) and not re.search(r"three\s+points?", clean):
+            clean = re.sub(r"\bone\s+plus\s+two\b", "one plus two three points", clean)
+
+        # ✨ NEW: Dynamic valid keyword verification
+        valid_keywords = ["safe", "out", "bonus", "tackle", "point", "points", "all out", "all in", self.team1, self.team2, "kabaddi"]
+        if not any(k in clean for k in valid_keywords):
+            return ""
+
+        clean = re.sub(r"\s+", " ", clean).strip()
+        clean = re.sub(r"\s*,\s*", ", ", clean)
+        clean = re.sub(r"^,|,$", "", clean).strip()
+
+        return clean.upper()
+
+    @staticmethod
+    def resolve_conflicts(referee_lines: list[str]) -> list[str]:
+        has_safe = any("SAFE" in ln for ln in referee_lines)
+        has_out = any(
+            "OUT" in ln and "ALL OUT" not in ln and "RAIDER OUT" not in ln.split(", ")[0]
+            for ln in referee_lines
+        ) or any("RAIDER OUT" in ln for ln in referee_lines)
+
+        if not (has_safe and has_out):
+            return referee_lines
+
+        last_is_out = False
+        for ln in reversed(referee_lines):
+            if "RAIDER OUT" in ln:
+                last_is_out = True
+                break
+            if "RAIDER SAFE" in ln:
+                last_is_out = False
+                break
+
+        resolved = []
+        for ln in referee_lines:
+            if last_is_out and "RAIDER SAFE" in ln: continue
+            if not last_is_out and "RAIDER OUT" in ln and "ALL OUT" not in ln: continue
+            resolved.append(ln)
+        return resolved
+
+    def analyze_clip(self, video_path: str, callback=None) -> dict:
         clip_name = os.path.basename(video_path)
-        raw_audio = "temp_raw.wav"
-        clean_audio = "temp_clean.wav"
-        
-        has_audio = self.extract_audio_from_video(video_path, raw_audio)
-        if not has_audio:
+        temp_audio = f"_tmp_audio_{os.getpid()}.wav"
+
+        log.info("[%s]  Extracting audio …", clip_name)
+        if not self.extract_audio(video_path, temp_audio):
+            log.warning("[%s]  No audio — skipping.", clip_name)
             return {"video_file": clip_name, "transcript": "", "referee_lines": []}
 
-        success, mean_rms = self.clean_audio(raw_audio, clean_audio)
-        
-        # THE GOLDEN FIX: If acoustic energy is below human speech threshold, skip Whisper entirely!
-        if mean_rms < 0.005:
-            if callback: callback({"type": "deep_log", "msg": f"🔇 Silent clip detected. Bypassing AI translation."})
+        try:
+            audio = whisperx.load_audio(temp_audio)
+        except Exception as exc:
+            log.error("[%s]  whisperx.load_audio failed: %s", clip_name, exc)
+            self._cleanup(temp_audio)
             return {"video_file": clip_name, "transcript": "", "referee_lines": []}
 
-        final_audio = clean_audio if success else raw_audio
+        log.info("[%s]  Running Faster-Whisper transcription …", clip_name)
+        try:
+            result = self.model.transcribe(
+                audio,
+                batch_size=4,          
+                language=self.language,
+                print_progress=False,
+            )
+        except Exception as exc:
+            log.error("[%s]  Transcription failed: %s", clip_name, exc)
+            self._cleanup(temp_audio)
+            return {"video_file": clip_name, "transcript": "", "referee_lines": []}
 
-        # Prompt biases the neural network towards Kabaddi terms
-        prompt_text = "Kabaddi referee calls: BONUS POINT CEG! BONUS POINT ACTECH! RAIDER SAFE, ONE POINT CEG! RAIDER OUT, ONE POINT ACTECH! SUPER TACKLE! EMPTY RAID!"
-        
-        # Expert Acoustic Thresholds applied
-        result = self.model.transcribe(
-            final_audio, 
-            fp16=False,
-            initial_prompt=prompt_text,
-            language="en", 
-            beam_size=5, 
-            no_speech_threshold=0.6,          # Stricter rejection of crowd noise
-            compression_ratio_threshold=2.4,  # Prevents AI looping/hallucinating text
-            logprob_threshold=-1.0,
-            condition_on_previous_text=False 
-        )
-        
-        referee_lines = []
-        unique_calls_set = set() 
-        
-        for segment in result['segments']:
-            raw_text = segment['text'].strip()
-            start = int(segment['start'])
-            end = int(segment['end'])
-            timestamp = f"[{start}s - {end}s]"
+        if not result.get("segments"):
+            log.info("[%s]  No speech detected.", clip_name)
+            self._cleanup(temp_audio)
+            return {"video_file": clip_name, "transcript": "", "referee_lines": []}
+
+        log.info("[%s]  Running Wav2Vec2 alignment …", clip_name)
+        try:
+            aligned = whisperx.align(
+                result["segments"],
+                self.align_model,
+                self.align_metadata,
+                audio,
+                self.device,
+                return_char_alignments=False,
+            )
+            segments = aligned["segments"]
+        except Exception as exc:
+            log.warning(
+                "[%s]  Alignment failed (%s) — using raw Whisper segments.", clip_name, exc
+            )
+            segments = result["segments"]
+
+        log.info("[%s]  Filtering referee calls …", clip_name)
+        referee_lines: list[str] = []
+        raw_transcripts: list[str] = []
+
+        start_time = 999.0
+        end_time = 0.0
+
+        for seg in segments:
+            raw_text = seg.get("text", "").strip()
+            if not raw_text: continue
             
-            strict_call = self.strict_referee_filter(raw_text)
+            raw_transcripts.append(raw_text)
+            s = round(seg.get("start", 0.0), 2)
+            e = round(seg.get("end", s + 1.0), 2)
             
-            if strict_call and strict_call not in unique_calls_set:
-                unique_calls_set.add(strict_call)
-                formatted_line = f"{timestamp} {strict_call.upper()}"
-                referee_lines.append(formatted_line)
+            start_time = min(start_time, s)
+            end_time = max(end_time, e)
+
+            if callback:
+                callback({
+                    "type": "segment",
+                    "timestamp": f"[{s}s - {e}s]",
+                    "text": raw_text,
+                    "is_referee": False,
+                    "keyword": raw_text,
+                })
+                time.sleep(0.05)
+
+        full_raw_text = " ".join(raw_transcripts).strip()
+        
+        if full_raw_text:
+            if start_time == 999.0: start_time = 0.0
+            if end_time == 0.0: end_time = 6.0
+            
+            ts = f"[{round(start_time, 1)}s - {round(end_time, 1)}s]"
+            call = self.parse_referee_call(full_raw_text)
+            
+            if call:
+                formatted = f"{ts} {call.upper()}"
+                referee_lines.append(formatted)
+                log.info("  CALL  %s", formatted)
                 
                 if callback:
                     callback({
                         "type": "segment",
-                        "timestamp": timestamp,
-                        "text": strict_call.upper(),
+                        "timestamp": ts,
+                        "text": call.upper(),
                         "is_referee": True,
-                        "keyword": strict_call.upper()
+                        "keyword": call.upper(),
                     })
                     time.sleep(0.05)
 
-        for f in [raw_audio, clean_audio]:
-            if os.path.exists(f):
-                try: os.remove(f)
-                except: pass 
+        referee_lines = self.resolve_conflicts(referee_lines)
+        self._cleanup(temp_audio)
 
-        final_transcript = "\n".join(referee_lines)
-
+        log.info("[%s]  Done — %d referee call(s) detected.", clip_name, len(referee_lines))
+        
         return {
             "video_file": clip_name,
-            "transcript": final_transcript.lower(), 
-            "referee_lines": referee_lines 
+            "transcript": full_raw_text.lower(),
+            "referee_lines": referee_lines,
         }
 
-    def process_directory(self, input_dir, output_dir, callback=None):
-        if not os.path.exists(output_dir): os.makedirs(output_dir)
-        files = [f for f in os.listdir(input_dir) if f.endswith('.mp4')]
-        
-        for i, file in enumerate(files):
-            if callback: callback({"type": "progress", "clip": file})
-            data = self.analyze_clip(os.path.join(input_dir, file), callback)
-            save_path = os.path.join(output_dir, file.replace('.mp4', '.txt'))
-            with open(save_path, 'w', encoding='utf-8') as f:
-                f.write("--- REFEREE ANNOUNCEMENTS (Strict Mode) ---\n")
-                if data['referee_lines']:
-                    for line in data['referee_lines']:
-                        f.write(f"{line}\n")
-                else:
-                    f.write("No referee announcements detected.\n")
+    def process_directory(self, input_dir: str, output_dir: str, callback=None) -> None:
+        os.makedirs(output_dir, exist_ok=True)
+        files = sorted(f for f in os.listdir(input_dir) if f.lower().endswith(".mp4"))
+
+        if not files:
+            log.warning("No .mp4 files found in %s", input_dir)
+            return
+
+        log.info("Processing %d clip(s) …", len(files))
+
+        for i, fname in enumerate(files, start=1):
+            log.info("─── Clip %d / %d : %s ───", i, len(files), fname)
+
+            if callback:
+                callback({"type": "progress", "clip": fname, "index": i, "total": len(files)})
+
+            data = self.analyze_clip(os.path.join(input_dir, fname), callback)
+
+            out_path = os.path.join(output_dir, fname.replace(".mp4", ".txt"))
+            self._write_result(out_path, data)
+
+            gc.collect()
+            if self.device == "cuda":
+                torch.cuda.empty_cache()
+
+    @staticmethod
+    def _write_result(out_path: str, data: dict) -> None:
+        with open(out_path, "w", encoding="utf-8") as fh:
+            fh.write("╔══════════════════════════════════════════╗\n")
+            fh.write("║   REFEREE ANNOUNCEMENTS  (Strict Mode)   ║\n")
+            fh.write("╚══════════════════════════════════════════╝\n\n")
+            if data["referee_lines"]:
+                for line in data["referee_lines"]:
+                    fh.write(f"  {line}\n")
+            else:
+                fh.write("  No distinct referee calls detected.\n")
+            fh.write("\n\n── FULL RAW TRANSCRIPT ──────────────────────\n")
+            fh.write(data["transcript"] or "(empty)" )
+            fh.write("\n")
+        log.info("Result saved → %s", out_path)
+
+    @staticmethod
+    def _cleanup(path: str) -> None:
+        try:
+            if path and os.path.exists(path):
+                os.remove(path)
+        except OSError:
+            pass
 
 if __name__ == "__main__":
-    agent = AudioAgent()
-    agent.process_directory("data/processed_clips", "data/transcripts")
+    # Example usage for dynamic teams
+    agent = AudioAgent(team1="PATNA", team2="MUMBA")
+    agent.process_directory("../../data/processed_clips", "../../data/transcripts")

@@ -2,7 +2,13 @@ import networkx as nx
 import json
 import os
 import glob
+
+# Ensure Streamlit does not crash on Windows when plotting
+import matplotlib
+matplotlib.use('Agg') 
 import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+
 from collections import Counter
 import time
 
@@ -32,90 +38,64 @@ class KabaddiGraph:
             metrics = visuals.get("tactical_metrics", {})
             audio = clip.get("audio_context", {})
             zonal = visuals.get("zonal_analysis", {})
-            
-            # --- 1. BLUE NODE (Clip) ---
-            self.G.add_node(clip_id, type="clip", time_index=i)
-            if callback:
-                callback({
-                    "type": "deep_log", 
-                    "msg": f"🔵 [CLIP NODE] Created: {clip_id} (Time Index: {i})"
-                })
 
-            # --- 2. TEMPORAL LINK ---
+            def_count = metrics.get("number_of_defenders", 0)
+            attack_vec = metrics.get("attack_vector", "Unknown")
+            is_raid = visuals.get("is_raid", False)
+            
+            ref_calls = audio.get("referee_events", [])
+            outcome = "neutral"
+            for call in ref_calls:
+                c = call.lower()
+                if "safe" in c or "bonus" in c: outcome = "raid_success"
+                if "out" in c or "super tackle" in c: outcome = "defense_success"
+
+            self.G.add_node(clip_id, type="clip", layer=0, timestamp=clip.get("timestamp_sync"))
+            
+            state_node = f"State_{def_count}_Defenders"
+            self.G.add_node(state_node, type="state", layer=1)
+            self.G.add_edge(clip_id, state_node, relation="occurred_in_state")
+
+            scene_node = "Active_Raid" if is_raid else "Defensive_Setup"
+            self.G.add_node(scene_node, type="scene", layer=1)
+            self.G.add_edge(clip_id, scene_node, relation="has_scene")
+            
+            # ✨ FIXED: The Attack Vector (Tactic Node) is now mapped universally!
+            # Removed the `if is_raid:` gate. Whether it is an Active Raid or Defensive Setup,
+            # the raider's flank position is always recorded in the Knowledge Graph.
+            tactic_node = f"Attack_{attack_vec}"
+            self.G.add_node(tactic_node, type="tactic", layer=2)
+            self.G.add_edge(clip_id, tactic_node, relation="used_tactic")
+                
+            if zonal and "court_distribution_percentages" in zonal:
+                dist = zonal["court_distribution_percentages"]
+                if dist:
+                    top_zone = max(dist, key=dist.get)
+                    zone_node = f"Zone_{top_zone}"
+                    self.G.add_node(zone_node, type="zone", layer=3)
+                    self.G.add_edge(clip_id, zone_node, relation="dominant_zone")
+
+            outcome_node = f"Outcome_{outcome}"
+            self.G.add_node(outcome_node, type="outcome", layer=4)
+            self.G.add_edge(clip_id, outcome_node, relation="resulted_in")
+
             if previous_clip_id:
-                self.G.add_edge(previous_clip_id, clip_id, relation="NEXT_PLAY")
-                if callback:
-                     callback({
-                        "type": "deep_log", 
-                        "msg": f"   ↳ ⛓️ [LINK] Temporal Flow: {previous_clip_id} --> {clip_id}"
-                    })
+                self.G.add_edge(previous_clip_id, clip_id, relation="followed_by")
             previous_clip_id = clip_id
             
-            # --- 3. ORANGE NODE (Tactic) ---
-            vector = metrics.get("attack_vector", "None")
-            if vector and vector != "None":
-                node_name = f"Tactic: {vector}"
-                self.G.add_node(node_name, type="tactic")
-                self.G.add_edge(clip_id, node_name, relation="USES_STRATEGY")
-                if callback: 
-                    callback({
-                        "type": "deep_log", 
-                        "msg": f"   ↳ 🟠 [TACTIC NODE] Identified Strategy: '{vector}' -> Linked to {clip_id}"
-                    })
+            if callback:
+                inter_path = self.visualize_match_topology(f"data/intermediate_graph_step_{i}.png")
+                callback({
+                    "type": "intermediate_plot", 
+                    "msg": f"   > Mapped {clip_id}: {scene_node}, {def_count} Def -> {outcome_node}",
+                    "path": inter_path
+                })
 
-            # --- 4. GREEN NODE (State) ---
-            def_count = metrics.get("defender_pack_size", 0)
-            if def_count > 0:
-                if def_count <= 3: 
-                    state_name = "State: Super Tackle Opp"
-                    reason = "Defenders <= 3 (High Stakes)"
-                elif def_count == 7: 
-                    state_name = "State: Full Defense"
-                    reason = "Defenders == 7 (Max Strength)"
-                else: 
-                    state_name = f"State: {def_count} Defenders"
-                    reason = f"Standard Defense ({def_count})"
-                
-                self.G.add_node(state_name, type="state")
-                self.G.add_edge(clip_id, state_name, relation="GAME_STATE")
-                if callback: 
-                    callback({
-                        "type": "deep_log", 
-                        "msg": f"   ↳ 🟢 [STATE NODE] Context: '{state_name}' (Reason: {reason})"
-                    })
-
-            # --- 5. RED NODE (Event) ---
-            ref_calls = audio.get("referee_events", [])
-            for call in ref_calls:
-                call_clean = call.split(']')[-1].strip()
-                node_name = f"Ref: {call_clean}"
-                self.G.add_node(node_name, type="event")
-                self.G.add_edge(clip_id, node_name, relation="OCCURRED")
-                if callback: 
-                    callback({
-                        "type": "deep_log", 
-                        "msg": f"   ↳ 🔴 [EVENT NODE] Outcome Detected: '{call_clean}' -> Linking Result"
-                    })
-                    
-            # --- 6. YELLOW NODE (Zonal) ---
-            if zonal:
-                court_dist = zonal.get("court_distribution_percentages", {})
-                if court_dist:
-                    highest_zone = max(court_dist, key=court_dist.get)
-                    zonal_node = f"Zone: {highest_zone.replace('_', ' ').title()}"
-                    self.G.add_node(zonal_node, type="zone")
-                    self.G.add_edge(clip_id, zonal_node, relation="PRIMARY_ATTACK_ZONE")
-                    if callback: 
-                        callback({
-                            "type": "deep_log", 
-                            "msg": f"   ↳ 🟡 [ZONE NODE] Attack Zone: '{zonal_node}' -> Linked to {clip_id}"
-                        })
-            
-            # Pacing for UI
-            time.sleep(0.1)
+        if callback: callback({"type": "log", "msg": f"✅ Graph Complete: {self.G.number_of_nodes()} Nodes, {self.G.number_of_edges()} Edges."})
 
     def get_tactical_insights(self):
         insights = {}
+        
         tactic_nodes = [n for n, attr in self.G.nodes(data=True) if attr.get("type") == "tactic"]
         if tactic_nodes:
             degrees = self.G.degree(tactic_nodes)
@@ -123,10 +103,13 @@ class KabaddiGraph:
             insights["dominant_strategy"] = top_tactic[0]
         else:
             insights["dominant_strategy"] = "None"
-
-        super_tackle_nodes = [n for n in self.G.predecessors("State: Super Tackle Opp")] if "State: Super Tackle Opp" in self.G else []
-        insights["super_tackle_scenarios"] = len(super_tackle_nodes)
-        
+            
+        super_tackle_state = "State_3_Defenders"
+        if super_tackle_state in self.G:
+            insights["super_tackle_scenarios"] = self.G.degree(super_tackle_state)
+        else:
+            insights["super_tackle_scenarios"] = 0
+            
         zone_nodes = [n for n, attr in self.G.nodes(data=True) if attr.get("type") == "zone"]
         if zone_nodes:
             z_degrees = self.G.degree(zone_nodes)
@@ -137,26 +120,93 @@ class KabaddiGraph:
             
         return insights
 
+    def get_clip_outcomes(self):
+        outcomes_list = []
+        for clip in self.clips_data:
+            clip_id = clip.get("clip_id")
+            audio = clip.get("audio_context", {})
+            ref_calls = audio.get("referee_events", [])
+            full_audio = " ".join(ref_calls).lower()
+            
+            outcome = "Neutral / Empty Raid"
+            
+            if "safe" in full_audio or "bonus" in full_audio:
+                if "ceg" in full_audio:
+                    outcome = "CEG Raider Success"
+                elif "actech" in full_audio:
+                    outcome = "ACTECH Raider Success"
+            elif "out" in full_audio or "super tackle" in full_audio:
+                if "ceg" in full_audio:
+                    outcome = "ACTECH Raider Failed"
+                elif "actech" in full_audio:
+                    outcome = "CEG Raider Failed"
+
+            outcomes_list.append({"Clip": clip_id, "Outcome": outcome})
+        return outcomes_list
+
+    def get_advanced_analytics(self):
+        zones = {"Left Corner": 0, "Left In": 0, "Center": 0, "Right In": 0, "Right Corner": 0}
+        intensities = []
+        for clip in self.clips_data:
+            zonal = clip.get("visual_context", {}).get("zonal_analysis", {})
+            dist = zonal.get("court_distribution_percentages", {})
+            if dist:
+                top_zone = max(dist, key=dist.get)
+                clean_zone = top_zone.replace("_", " ").title()
+                if clean_zone in zones:
+                    zones[clean_zone] += 1
+                else:
+                    zones[clean_zone] = 1
+            
+            metrics = clip.get("visual_context", {}).get("tactical_metrics", {})
+            intensities.append(metrics.get("raider_movement_intensity", 0.0))
+            
+        return {
+            "attack_zones": zones,
+            "intensities": intensities
+        }
+
     def visualize_match_topology(self, output_path="data/match_graph.png"):
         try:
-            plt.figure(figsize=(10, 6))
-            pos = nx.spring_layout(self.G, k=0.5, iterations=50)
+            plt.figure(figsize=(16, 9)) 
+            
+            pos = nx.multipartite_layout(self.G, subset_key="layer", align="horizontal")
+            
             color_map = []
             for node in self.G:
                 ntype = self.G.nodes[node].get("type", "unknown")
-                if ntype == "clip": color_map.append('#87CEFA')   
-                elif ntype == "tactic": color_map.append('#FFA500') 
-                elif ntype == "state": color_map.append('#90EE90')  
-                elif ntype == "event": color_map.append('#FF6347')  
-                elif ntype == "zone": color_map.append('#FFFF00')  
-                else: color_map.append('grey')
-            nx.draw(self.G, pos, node_color=color_map, with_labels=True, font_size=8, node_size=800, alpha=0.9, edge_color='gray')
-            plt.title("Kabaddi Match Tactical Topology")
-            plt.savefig(output_path)
+                if ntype == "clip": color_map.append('#87CEFA')        
+                elif ntype == "tactic": color_map.append('#FFA500')    
+                elif ntype == "state": color_map.append('#90EE90')     
+                elif ntype == "outcome": color_map.append('#FF6347')   
+                elif ntype == "zone": color_map.append('#FFFF00')      
+                elif ntype == "scene": color_map.append('#DA70D6')     
+                else: color_map.append('#D3D3D3')                      
+
+            nx.draw_networkx_edges(self.G, pos, edge_color='gray', arrows=True, arrowsize=15, alpha=0.4)
+            nx.draw_networkx_nodes(self.G, pos, node_color=color_map, node_size=1800, edgecolors='black', linewidths=1.2)
+            
+            labels = {node: str(node).replace("_", "\n") for node in self.G.nodes()}
+            nx.draw_networkx_labels(self.G, pos, labels=labels, font_size=8, font_weight="bold", font_color="black")
+            
+            legend_handles = [
+                mpatches.Patch(color='#87CEFA', label='Video Clip'),
+                mpatches.Patch(color='#DA70D6', label='Scene Type'),
+                mpatches.Patch(color='#90EE90', label='Court State (Defenders)'),
+                mpatches.Patch(color='#FFA500', label='Raid Tactic (Attack Vector)'),
+                mpatches.Patch(color='#FFFF00', label='Dominant Zone'),
+                mpatches.Patch(color='#FF6347', label='Match Outcome')
+            ]
+            plt.legend(handles=legend_handles, loc='upper right', fontsize=10, title="Node Hierarchy", title_fontsize=12, framealpha=0.9)
+            
+            plt.title("Kabaddi Tactical Knowledge Graph (Hierarchical Layout)", fontsize=18, fontweight='bold', pad=20)
+            plt.axis('off')
+            plt.tight_layout()
+            
+            plt.savefig(output_path, bbox_inches='tight', dpi=200) 
             plt.close()
+            
             return output_path
         except Exception as e:
+            print(f"Graph Plot Error: {e}")
             return None
-
-if __name__ == "__main__":
-    pass

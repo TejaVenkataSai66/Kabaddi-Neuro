@@ -1,10 +1,13 @@
 from google import genai
 import os
+from dotenv import load_dotenv
 
 # YOUR KEY
-API_KEY = "AIzaSyDrcndeFrz2Wh6_eR-z9NG2HBJvjpkVZfk" 
+#API_KEY = "AIzaSyDrcndeFrz2Wh6_eR-z9NG2HBJvjpkVZfk" 
 
 try:
+    load_dotenv()
+    API_KEY = os.getenv("GEMINI_API_KEY")
     client = genai.Client(api_key=API_KEY)
     print("✅ Authentication Successful. Listing ALL models:")
     print("-" * 40)

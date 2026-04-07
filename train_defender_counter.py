@@ -110,4 +110,4 @@ if __name__ == "__main__":
     OUTPUT_MODEL = "defender_counter_cnn.pth" 
     
     # We will run 4 epochs again
-    train_multiclass_cnn(DATASET_DIR, OUTPUT_MODEL, num_epochs=4)
+    train_multiclass_cnn(DATASET_DIR, OUTPUT_MODEL, num_epochs=8)
